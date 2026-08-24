@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""
+=============================================================================
+APEX SECURITY - VULNERABLE TARGET APPLICATION (SECURITY BENCHMARK)
+Projeto: Apex Security ASPM - Test Suite
+Aviso: Código intencionalmente vulnerável para testes de SAST/SCA/Secrets.
+=============================================================================
+"""
+
+import os
+import sys
+import yaml
+import pickle
+import base64
+import sqlite3
+import hashlib
+import random
+import requests
+import subprocess
+from flask import Flask, request, jsonify, render_template_string
+
+app = Flask(__name__)
+
+# =============================================================================
+# 1. HARDCODED SECRETS & LEAKED CREDENTIALS (CWE-798, CWE-312)
+# =============================================================================
+# O scanner de Secrets do Semgrep / Gitleaks DEVE capturar estes padrões:
+AWS_ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE"
+AWS_SECRET_ACCESS_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+GITHUB_PERSONAL_TOKEN = "ghp_FakeTokenForApexSecurityPipelineTest0123456789"
+DATABASE_URI = "postgresql://db_master_admin:Sup3rS3cr3tP@ssw0rd2026@10.0.0.15:5432/apex_production"
+JWT_SIGNING_SECRET = "hardcoded_monolithic_jwt_key_that_should_never_exist_in_source"
+
+RSA_PRIVATE_KEY_SIMULATION = """-----BEGIN RSA PRIVATE KEY-----
+MIIEowIBAAKCAQEA0Z3v8q3e1k7v4Q2Y9K8r1Xy7l2v7M5n3K8r1Xy7l2v7M5n3K
+8r1Xy7l2v7M5n3K8r1Xy7l2v7M5n3K8r1Xy7l2v7M5n3K8r1Xy7l2v7M5n3K8r1X
+FakeKeyHeaderForTestingApexSecretScannerEnginePipelineTruePositive00
+-----END RSA PRIVATE KEY-----"""
+
+
+# =============================================================================
+# 2. SQL INJECTION (SQLi) - (CWE-89 / OWASP A03)
+# =============================================================================
+@app.route("/api/v1/users/search", methods=["GET"])
+def sql_injection_endpoint():
+    user_id = request.args.get("id", "1")
+    conn = sqlite3.connect("database.db")
+    cursor = conn.cursor()
+    
+    # VULNERABILIDADE CRÍTICA: Concatenação crua de string em query SQL
+    query = f"SELECT id, username, email, role FROM users WHERE id = '{user_id}' AND is_active = 1"
+    cursor.execute(query)
+    results = cursor.fetchall()
+    conn.close()
+    
+    return jsonify({"query_executed": query, "data": results})
+
+
+# =============================================================================
+# 3. REMOTE COMMAND INJECTION (RCE) - (CWE-78 / OWASP A03)
+# =============================================================================
+@app.route("/api/v1/network/diagnostics", methods=["POST"])
+def command_injection_endpoint():
+    data = request.get_json(force=True) or {}
+    target_host = data.get("host", "127.0.0.1")
+    
+    # VULNERABILIDADE CRÍTICA: shell=True com entrada não sanitizada
+    # Payload de teste: "127.0.0.1; cat /etc/passwd" ou "127.0.0.1 | whoami"
+    process = subprocess.Popen(
+        f"ping -c 1 {target_host}",
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
+    )
+    stdout, stderr = process.communicate()
+    
+    # VULNERABILIDADE SECUNDÁRIA: os.system inseguro
+    os.system(f"echo 'Diagnostics executed for: {target_host}' >> /tmp/audit.log")
+    
+    return jsonify({
+        "status": "completed",
+        "stdout": stdout.decode("utf-8", errors="ignore"),
+        "stderr": stderr.decode("utf-8", errors="ignore")
+    })
+
+
+# =============================================================================
+# 4. INSECURE DESERIALIZATION (CWE-502 / OWASP A08)
+# =============================================================================
+@app.route("/api/v1/session/restore", methods=["POST"])
+def insecure_deserialization_pickle():
+    payload_b64 = request.headers.get("X-Session-Data", "")
+    
+    if not payload_b64:
+        return jsonify({"error": "Missing session header"}), 400
+        
+    # VULNERABILIDADE CRÍTICA: Deserialização de Python Pickle não confiável
+    raw_payload = base64.b64decode(payload_b64)
+    user_session_object = pickle.loads(raw_payload)  # RCE imediato via __reduce__
+    
+    return jsonify({"status": "session_restored", "user": str(user_session_object)})
+
+
+@app.route("/api/v1/config/parse-yaml", methods=["POST"])
+def insecure_yaml_load():
+    yaml_content = request.data.decode("utf-8")
+    
+    # VULNERABILIDADE CRÍTICA: Uso do Loader padrão sem SafeLoader
+    parsed_config = yaml.load(yaml_content, Loader=yaml.Loader)
+    
+    return jsonify({"parsed_keys": list(parsed_config.keys()) if isinstance(parsed_config, dict) else "raw"})
+
+
+# =============================================================================
+# 5. SERVER-SIDE REQUEST FORGERY (SSRF) - (CWE-918 / OWASP A10)
+# =============================================================================
+@app.route("/api/v1/proxy/fetch-avatar", methods=["GET"])
+def ssrf_endpoint():
+    image_url = request.args.get("url", "https://example.com/avatar.png")
+    
+    # VULNERABILIDADE ALTA: Requisição HTTP direta sem validação de IP interno (Metadata / Loopback)
+    # Payload de teste: "http://169.254.169.254/latest/meta-data/" ou "http://localhost:5432"
+    # VULNERABILIDADE MÉDIA ADICIONAL: verify=False desativa verificação de certificados TLS
+    response = requests.get(image_url, timeout=5, verify=False)
+    
+    return jsonify({
+        "source_url": image_url,
+        "content_length": len(response.content),
+        "content_type": response.headers.get("Content-Type")
+    })
+
+
+# =============================================================================
+# 6. PATH TRAVERSAL / ARBITRARY FILE READ (CWE-22 / OWASP A01)
+# =============================================================================
+@app.route("/api/v1/system/logs", methods=["GET"])
+def path_traversal_endpoint():
+    log_filename = request.args.get("file", "access.log")
+    
+    # VULNERABILIDADE ALTA: Concatenação de caminho sem sanitização de '../'
+    # Payload de teste: "?file=../../../../etc/shadow" ou "?file=../../../../etc/passwd"
+    base_directory = "/var/log/apex_app/"
+    target_path = os.path.join(base_directory, log_filename)
+    
+    try:
+        with open(target_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read(2048)
+        return jsonify({"filename": log_filename, "preview": content})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# =============================================================================
+# 7. CROSS-SITE SCRIPTING (XSS) & SSTI (CWE-79, CWE-1336)
+# =============================================================================
+@app.route("/api/v1/portal/welcome", methods=["GET"])
+def reflected_xss_and_ssti():
+    username = request.args.get("name", "Guest")
+    
+    # VULNERABILIDADE ALTA: Renderização de template com injeção direta de string
+    # Payload SSTI: "{{ 7 * 7 }}" ou "{{ config.items() }}"
+    template_code = f"""
+    <!DOCTYPE html>
+    <html>
+    <head><title>Apex Security Target App</title></head>
+    <body>
+        <h1>Bem-vindo, {username}!</h1>
+        <p>Sua autenticação foi processada com sucesso no gateway legado.</p>
+    </body>
+    </html>
+    """
+    return render_template_string(template_code)
+
+
+# =============================================================================
+# 8. BROKEN CRYPTOGRAPHY & WEAK RANDOMNESS (CWE-327, CWE-338)
+# =============================================================================
+def generate_insecure_auth_token(user_id: str) -> str:
+    # VULNERABILIDADE MÉDIA: MD5 é criptograficamente quebrado para hash de segurança
+    hash_obj = hashlib.md5()
+    hash_obj.update(user_id.encode("utf-8"))
+    
+    # VULNERABILIDADE MÉDIA: random.randint() não é criptograficamente seguro (CWE-338)
+    # Deveria usar o módulo 'secrets'
+    pseudo_entropy = random.randint(100000, 999999)
+    
+    return f"{hash_obj.hexdigest()}-{pseudo_entropy}"
+
+
+@app.route("/api/v1/auth/insecure-token", methods=["POST"])
+def auth_token_generator():
+    uid = request.json.get("uid", "anonymous") if request.is_json else "anonymous"
+    token = generate_insecure_auth_token(uid)
+    return jsonify({"uid": uid, "temporary_token": token})
+
+
+# =============================================================================
+# 9. INSECURE CONFIGURATION (CWE-489)
+# =============================================================================
+if __name__ == "__main__":
+    # VULNERABILIDADE: Debug mode ativado em execução direta expõe Werkzeug debugger
+    app.run(host="0.0.0.0", port=5000, debug=True)
